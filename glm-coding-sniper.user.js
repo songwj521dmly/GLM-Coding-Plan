@@ -1,8 +1,8 @@
   // ==UserScript==
   // @name         GLM Coding Plan Pro 自动抢购
   // @namespace    https://bigmodel.cn
-  // @version      1.6.0
-  // @description  每天10:00自动抢购GLM Coding Plan 套餐，拦截售罄+自动点击+错误恢复+弹窗保护+路由重挂载+Chrome/Firefox兼容增强
+  // @version      1.6.1
+  // @description  每天10:00自动抢购GLM Coding Plan 套餐，拦截售罄+自动点击+错误恢复+弹窗保护+路由重挂载+套餐映射可视化防错
   // @author       songwj
   // @match        https://open.bigmodel.cn/*
   // @match        https://www.bigmodel.cn/*
@@ -237,7 +237,7 @@
           log(`[候补] ${prev.plan}/${prev.billingPeriod} 售罄 → 切换到 ${next.plan}/${next.billingPeriod}`);
           notify('GLM 候补切换', `${prev.plan} 已售罄，正在尝试 ${next.plan}`);
         }
-        _capturedProductId = null;
+        clearCapturedProductId('retryReset');
         getProductId();
         updateTargetDisplay();
         setStatus(`候补: ${next.plan.toUpperCase()} / ${{monthly:'包月',quarterly:'包季',yearly:'包年'}[next.billingPeriod]||'包季'}`, '#ffaa00');
@@ -268,6 +268,7 @@
       if (!el) return;
       const periodLabel = {monthly:'包月', quarterly:'包季', yearly:'包年'}[currentPeriod()] || '包季';
       el.textContent = `目标: ${currentPlan().toUpperCase()} / ${periodLabel}`;
+      updateResolvedProductDisplay();
     }
 
     // 主动探测一次服务端 soldOut 状态，直接解析不依赖拦截链
@@ -578,12 +579,16 @@
           const key = `${info.plan}_${info.period}`;
           _allProductIds[key] = item.productId;
           if (info.plan === currentPlan() && info.period === currentPeriod()) {
-            _capturedProductId = item.productId;
+            setCapturedProductId(item.productId, {
+              plan: info.plan,
+              period: info.period,
+              source: 'batchPreview',
+            });
             // 持久化到 localStorage，刷新后立即可用，无需等 API 响应
             try {
               localStorage.setItem('glm_sniper_pid', JSON.stringify({
-                id: item.productId, plan: currentPlan(),
-                period: currentPeriod(), ts: Date.now(),
+                id: item.productId, plan: info.plan,
+                period: info.period, source: 'batchPreview', ts: Date.now(),
               }));
             } catch (e) {}
           }
@@ -610,11 +615,15 @@
           if (!_capturedProductId) {
             const pid = getProductIdFromCandidates();
             if (pid) {
-              _capturedProductId = pid;
+              setCapturedProductId(pid, {
+                plan: currentPlan(),
+                period: currentPeriod(),
+                source: 'productinfo',
+              });
               log(`[productinfo] 已设定 productId=${pid}（来自候选表）`);
               try {
                 localStorage.setItem('glm_sniper_pid', JSON.stringify({
-                  id: pid, plan: currentPlan(), period: currentPeriod(), ts: Date.now(),
+                  id: pid, plan: currentPlan(), period: currentPeriod(), source: 'productinfo', ts: Date.now(),
                 }));
               } catch (e) {}
             }
@@ -640,21 +649,33 @@
       if (_capturedProductId) return _capturedProductId;
       // 手动配置优先
       if (CONFIG.manualProductId && CONFIG.manualProductId[currentPlan()]) {
-        _capturedProductId = CONFIG.manualProductId[currentPlan()];
+        setCapturedProductId(CONFIG.manualProductId[currentPlan()], {
+          plan: currentPlan(),
+          period: currentPeriod(),
+          source: 'manual',
+        });
         log(`[手动] 使用配置的 productId=${_capturedProductId} (${currentPlan()})`);
         return _capturedProductId;
       }
       // 精确匹配
       const exactKey = `${currentPlan()}_${currentPeriod()}`;
       if (_allProductIds[exactKey]) {
-        _capturedProductId = _allProductIds[exactKey];
+        setCapturedProductId(_allProductIds[exactKey], {
+          plan: currentPlan(),
+          period: currentPeriod(),
+          source: 'fallbackExact',
+        });
         log(`[回退] 精确匹配 productId=${_capturedProductId} (${exactKey})`);
         return _capturedProductId;
       }
       // 同套餐不同周期
       for (const [key, pid] of Object.entries(_allProductIds)) {
         if (key.startsWith(currentPlan() + '_')) {
-          _capturedProductId = pid;
+          setCapturedProductId(pid, {
+            plan: currentPlan(),
+            period: key.split('_')[1] || currentPeriod(),
+            source: 'fallbackSamePlan',
+          });
           log(`[回退] 同套餐匹配 productId=${pid} (${key})`);
           return pid;
         }
@@ -666,7 +687,11 @@
       // productinfo 候选表回退
       const candidate = getProductIdFromCandidates();
       if (candidate) {
-        _capturedProductId = candidate;
+        setCapturedProductId(candidate, {
+          plan: currentPlan(),
+          period: currentPeriod(),
+          source: 'fallbackCandidate',
+        });
         log(`[回退] 从 productinfo 候选表获取 productId=${candidate}`);
         return _capturedProductId;
       }
@@ -675,7 +700,11 @@
         const saved = JSON.parse(localStorage.getItem('glm_sniper_pid') || 'null');
         if (saved && saved.id && saved.plan === currentPlan() &&
             saved.period === currentPeriod() && Date.now() - saved.ts < 43200000) {
-          _capturedProductId = saved.id;
+          setCapturedProductId(saved.id, {
+            plan: saved.plan,
+            period: saved.period,
+            source: saved.source || 'localStorage',
+          });
           log(`[回退] 从 localStorage 恢复 productId=${saved.id}`);
           return _capturedProductId;
         }
@@ -733,6 +762,99 @@
 
     // 捕获的 productId (从 JSON.parse / API 响应 / 请求中提取)
     let _capturedProductId = null;
+    let _capturedProductMeta = { plan: null, period: null, source: 'pending', ts: 0 };
+
+    /**
+     * 格式化套餐名与周期，便于在悬浮窗中直观展示。
+     * @param {string|null} plan 套餐名。
+     * @param {string|null} period 计费周期。
+     * @returns {string} 可读文本。
+     */
+    function formatPlanPeriod(plan, period) {
+      const planLabel = plan ? plan.toUpperCase() : '未识别';
+      const periodLabel = { monthly: '包月', quarterly: '包季', yearly: '包年' }[period] || '周期未知';
+      return `${planLabel} / ${periodLabel}`;
+    }
+
+    /**
+     * 将内部 productId 来源转换为用户可读文本。
+     * @param {string} source 内部来源标识。
+     * @returns {string} 中文来源说明。
+     */
+    function getProductSourceLabel(source) {
+      const sourceMap = {
+        pending: '等待识别',
+        batchPreview: '接口识别',
+        productinfo: '候选表匹配',
+        manual: '手动配置',
+        fallbackExact: '精确回退',
+        fallbackSamePlan: '同套餐回退',
+        fallbackCandidate: '候选回退',
+        localStorage: '本地缓存',
+        fetchCapture: '页面请求',
+        xhrCapture: '页面请求(XHR)',
+        fetchInject: '自动补参',
+        xhrInject: '自动补参(XHR)',
+        retryReset: '等待重新识别',
+      };
+      return sourceMap[source] || source || '未知来源';
+    }
+
+    /**
+     * 将已识别的 productId 与其元信息写入内存，并刷新悬浮窗展示。
+     * @param {string|null} pid 商品 ID。
+     * @param {{plan?: string|null, period?: string|null, source?: string}} [meta] 附加元信息。
+     * @returns {string|null} 当前写入后的 productId。
+     */
+    function setCapturedProductId(pid, meta = {}) {
+      _capturedProductId = pid || null;
+      _capturedProductMeta = {
+        plan: meta.plan ?? _capturedProductMeta.plan ?? null,
+        period: meta.period ?? _capturedProductMeta.period ?? null,
+        source: meta.source || _capturedProductMeta.source || 'pending',
+        ts: Date.now(),
+      };
+      updateResolvedProductDisplay();
+      return _capturedProductId;
+    }
+
+    /**
+     * 清空当前锁定的 productId，避免候补切换后误用旧套餐编号。
+     * @param {string} [source='retryReset'] 清空原因。
+     * @returns {void}
+     */
+    function clearCapturedProductId(source = 'retryReset') {
+      _capturedProductId = null;
+      _capturedProductMeta = { plan: null, period: null, source, ts: Date.now() };
+      updateResolvedProductDisplay();
+    }
+
+    /**
+     * 同步悬浮窗中的 productId 信息，减少用户对当前锁定套餐的疑问。
+     * @returns {void}
+     */
+    function updateResolvedProductDisplay() {
+      const productEl = document.getElementById('glm-product');
+      const noteEl = document.getElementById('glm-product-note');
+      if (!productEl || !noteEl) return;
+
+      if (!_capturedProductId) {
+        productEl.textContent = '锁定商品: 未锁定';
+        productEl.style.color = '#ffcc00';
+        noteEl.textContent = `等待识别 ${formatPlanPeriod(currentPlan(), currentPeriod())} 的 productId`;
+        noteEl.style.color = '#888';
+        return;
+      }
+
+      const resolvedPlan = _capturedProductMeta.plan || currentPlan();
+      const resolvedPeriod = _capturedProductMeta.period || currentPeriod();
+      const matched = resolvedPlan === currentPlan() && resolvedPeriod === currentPeriod();
+      const sourceLabel = getProductSourceLabel(_capturedProductMeta.source);
+      productEl.textContent = `锁定商品: ${formatPlanPeriod(resolvedPlan, resolvedPeriod)}`;
+      productEl.style.color = matched ? '#00ff88' : '#ff8800';
+      noteEl.textContent = `productId=${_capturedProductId} | 来源: ${sourceLabel} | ${matched ? '已匹配当前目标' : '与当前目标不一致，请勿付款'}`;
+      noteEl.style.color = matched ? '#aaa' : '#ff6666';
+    }
 
     // --- 2a. fetch 拦截 ---
     const originalFetch = window.fetch;
@@ -767,21 +889,39 @@
             if (bodyObj.productId) {
               if (!_capturedProductId) {
                 // 首次捕获：暂存请求中的 productId
-                _capturedProductId = bodyObj.productId;
+                setCapturedProductId(bodyObj.productId, {
+                  plan: currentPlan(),
+                  period: currentPeriod(),
+                  source: 'fetchCapture',
+                });
                 log(`[捕获] productId=${_capturedProductId}`);
               } else if (bodyObj.productId !== _capturedProductId && !_forcePayDialogCalled && !state.orderCreated) {
                 // 页面发出了不同的 productId（用户点击了不同套餐的按钮）
                 // 信任页面的选择，更新 _capturedProductId 为新的值
                 log(`[更新] productId 变更: ${_capturedProductId} → ${bodyObj.productId}（页面选择了不同套餐）`);
-                _capturedProductId = bodyObj.productId;
+                setCapturedProductId(bodyObj.productId, {
+                  plan: currentPlan(),
+                  period: currentPeriod(),
+                  source: 'fetchCapture',
+                });
               }
             } else if (!_forcePayDialogCalled && !state.orderCreated) {
               // 请求中没有 productId，尝试注入（先精确匹配，再 productinfo 候选）
+              const hadCapturedPid = !!_capturedProductId;
               const pid = _capturedProductId || getProductIdFromCandidates();
               if (pid) {
                 bodyObj.productId = pid;
                 args[1] = { ...args[1], body: JSON.stringify(bodyObj) };
-                if (pid !== _capturedProductId) {
+                if (!hadCapturedPid) {
+                  setCapturedProductId(pid, {
+                    plan: currentPlan(),
+                    period: currentPeriod(),
+                    source: 'fetchInject',
+                  });
+                } else {
+                  updateResolvedProductDisplay();
+                }
+                if (!hadCapturedPid) {
                   log(`[注入] 使用 productinfo 候选 productId=${pid}（请确认套餐是否正确）`);
                 } else {
                   log(`[注入] 已补充 productId=${pid}`);
@@ -920,19 +1060,37 @@
           if (bodyObj) {
             if (bodyObj.productId) {
               if (!_capturedProductId) {
-                _capturedProductId = bodyObj.productId;
+                setCapturedProductId(bodyObj.productId, {
+                  plan: currentPlan(),
+                  period: currentPeriod(),
+                  source: 'xhrCapture',
+                });
                 log(`[捕获] productId=${_capturedProductId} (XHR)`);
               } else if (bodyObj.productId !== _capturedProductId && !_forcePayDialogCalled && !state.orderCreated) {
                 // 页面发出了不同的 productId，信任页面的选择
                 log(`[更新] productId 变更: ${_capturedProductId} → ${bodyObj.productId} (XHR)`);
-                _capturedProductId = bodyObj.productId;
+                setCapturedProductId(bodyObj.productId, {
+                  plan: currentPlan(),
+                  period: currentPeriod(),
+                  source: 'xhrCapture',
+                });
               }
             } else if (!_forcePayDialogCalled && !state.orderCreated) {
+              const hadCapturedPid = !!_capturedProductId;
               const pid = _capturedProductId || getProductIdFromCandidates();
               if (pid) {
                 bodyObj.productId = pid;
                 args[0] = JSON.stringify(bodyObj);
-                if (pid !== _capturedProductId) {
+                if (!hadCapturedPid) {
+                  setCapturedProductId(pid, {
+                    plan: currentPlan(),
+                    period: currentPeriod(),
+                    source: 'xhrInject',
+                  });
+                } else {
+                  updateResolvedProductDisplay();
+                }
+                if (!hadCapturedPid) {
                   log(`[注入] 使用 productinfo 候选 productId=${pid}（请确认套餐是否正确）(XHR)`);
                 } else {
                   log(`[注入] 已补充 productId=${pid} (XHR)`);
@@ -1015,7 +1173,7 @@
               // 第一步：先重新 fetch 正确的 productId（避免用错误候选再次提交）
               log('[验证码后] 支付弹窗未出现，先重新获取 productId...');
               setStatus('重新获取 productId...', '#ffcc00');
-              _capturedProductId = null; // 清掉可能错误的候选值，强制重新匹配
+              clearCapturedProductId('retryReset'); // 清掉可能错误的候选值，强制重新匹配
               await fetchProductIdDirectly();
               // 等 1s，看页面是否自动刷新状态后弹出支付窗
               await new Promise(r => setTimeout(r, 1000));
@@ -1126,6 +1284,12 @@
           <div id="glm-target" style="color: #ffcc00; margin-bottom: 4px;">
             目标: ${currentPlan().toUpperCase()} / ${{monthly:'包月',quarterly:'包季',yearly:'包年'}[currentPeriod()]||'包季'}
           </div>
+          <div id="glm-product" style="color: #ffcc00; margin-bottom: 4px;">
+            锁定商品: 未锁定
+          </div>
+          <div id="glm-product-note" style="color: #888; font-size: 11px; line-height: 1.4;">
+            等待识别 ${formatPlanPeriod(currentPlan(), currentPeriod())} 的 productId
+          </div>
           <div id="glm-countdown" style="font-size: 20px; margin: 8px 0; color: #fff;">
             --:--:--
           </div>
@@ -1157,6 +1321,7 @@
       `;
       document.body.appendChild(overlay);
       markBoot('overlay-mounted', '悬浮窗已挂载');
+      updateResolvedProductDisplay();
 
       const notifBtn = document.getElementById('glm-notif-btn');
       if (notifBtn) {
@@ -1399,7 +1564,11 @@
       }
       // 优先使用手动配置的 productId
       if (CONFIG.manualProductId && CONFIG.manualProductId[currentPlan()]) {
-        _capturedProductId = CONFIG.manualProductId[currentPlan()];
+        setCapturedProductId(CONFIG.manualProductId[currentPlan()], {
+          plan: currentPlan(),
+          period: currentPeriod(),
+          source: 'manual',
+        });
         log(`[主动获取] 使用手动配置: ${currentPlan()}=${_capturedProductId}`);
         return true;
       }
@@ -2169,7 +2338,11 @@
         const saved = JSON.parse(localStorage.getItem('glm_sniper_pid') || 'null');
         if (saved && saved.id && saved.plan === currentPlan() &&
             saved.period === currentPeriod() && Date.now() - saved.ts < 43200000) {
-          _capturedProductId = saved.id;
+          setCapturedProductId(saved.id, {
+            plan: saved.plan,
+            period: saved.period,
+            source: saved.source || 'localStorage',
+          });
           log(`[localStorage] 预加载 productId=${saved.id}`);
         }
       } catch (e) {}
