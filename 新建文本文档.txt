@@ -9,6 +9,8 @@
   // @match        https://bigmodel.cn/*
   // @grant        none
   // @run-at       document-start
+  // @updateURL    https://raw.githubusercontent.com/songwj521dmly/GLM-Coding-Plan/master/glm-coding-sniper.user.js
+  // @downloadURL  https://raw.githubusercontent.com/songwj521dmly/GLM-Coding-Plan/master/glm-coding-sniper.user.js
   // ==/UserScript==
 
   (function () {
