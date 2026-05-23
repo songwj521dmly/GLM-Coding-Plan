@@ -1,9 +1,9 @@
   // ==UserScript==
   // @name         GLM Coding Plan Pro 自动抢购
   // @namespace    https://bigmodel.cn
-  // @version      1.5.0
-  // @description  每天10:00自动抢购GLM Coding Plan Pro套餐，拦截售罄+自动点击+错误恢复+弹窗保护+自动重触发
-  // @author       hd233yui
+  // @version      1.6.0
+  // @description  每天10:00自动抢购GLM Coding Plan 套餐，拦截售罄+自动点击+错误恢复+弹窗保护+路由重挂载+Chrome/Firefox兼容增强
+  // @author       songwj
   // @match        https://open.bigmodel.cn/*
   // @match        https://www.bigmodel.cn/*
   // @match        https://bigmodel.cn/*
@@ -29,7 +29,7 @@
       // 套餐优先级列表，按顺序尝试；第一个为首选，后续为候补
       // 每项: { plan: 'lite'|'pro'|'max', billingPeriod: 'monthly'|'quarterly'|'yearly' }
       planPriority: [
-        { plan: 'pro', billingPeriod: 'quarterly' },
+        { plan: 'lite', billingPeriod: 'quarterly' },
         // { plan: 'lite', billingPeriod: 'quarterly' }, // 候补（取消注释以启用）
       ],
       // 抢购时间 (24小时制)
@@ -71,6 +71,67 @@
       timerId: null,
       countdownId: null,
     };
+
+    const OVERLAY_ID = 'glm-sniper-overlay';
+    const BOOT_CACHE_KEY = 'glm_sniper_last_boot';
+    const runtime = {
+      routeHooksInstalled: false,
+      overlayWatcherInstalled: false,
+      initFinished: false,
+    };
+
+    /**
+     * 判断当前页面是否为 GLM Coding 抢购页。
+     * @returns {boolean} 当前 URL 是否命中目标购买页。
+     */
+    function isTargetPage() {
+      return /^\/glm-coding(?:\/)?$/i.test(window.location.pathname);
+    }
+
+    /**
+     * 记录脚本启动阶段，便于排查“脚本未生效”与 SPA 路由丢失问题。
+     * @param {string} stage 当前阶段名称。
+     * @param {string} [extra] 额外诊断信息。
+     * @returns {void}
+     */
+    function markBoot(stage, extra = '') {
+      const message = `[BOOT] ${stage}${extra ? ` | ${extra}` : ''}`;
+      console.log(`[GLM Sniper] ${message}`);
+      try {
+        sessionStorage.setItem(BOOT_CACHE_KEY, JSON.stringify({
+          stage,
+          extra,
+          url: window.location.href,
+          ts: Date.now(),
+        }));
+      } catch (e) {}
+    }
+
+    /**
+     * 安全读取浏览器通知权限，避免部分环境下直接访问 Notification 报错。
+     * @returns {NotificationPermission|'unsupported'} 当前通知权限状态。
+     */
+    function getNotificationPermissionSafe() {
+      try {
+        if (typeof Notification === 'undefined') return 'unsupported';
+        return Notification.permission;
+      } catch (e) {
+        return 'unsupported';
+      }
+    }
+
+    /**
+     * 安全请求浏览器通知权限。
+     * @returns {Promise<NotificationPermission|'unsupported'>} 权限请求结果。
+     */
+    function requestNotificationPermissionSafe() {
+      if (typeof Notification === 'undefined') return Promise.resolve('unsupported');
+      try {
+        return Notification.requestPermission();
+      } catch (e) {
+        return Promise.resolve('unsupported');
+      }
+    }
 
     // ==================== 1. 拦截 JSON.parse，修改售罄状态 ====================
     // 只在 10:00 前1分钟内才拦截，避免非抢购时段产生无效订单
@@ -359,7 +420,7 @@
 
     function notify(title, body) {
       try {
-        if (Notification.permission === 'granted') {
+        if (getNotificationPermissionSafe() === 'granted') {
           new Notification(title, { body, icon: 'https://open.bigmodel.cn/favicon.ico' });
         }
       } catch (e) {}
@@ -1022,6 +1083,10 @@
 
     // ==================== 3. UI 覆盖层 ====================
     function createOverlay() {
+      if (!isTargetPage()) {
+        markBoot('overlay-skip', '当前页面不是 glm-coding');
+        return;
+      }
       // 等待 body 存在 (SPA 框架可能延迟创建)
       if (!document.body) {
         if (document.readyState === 'loading') {
@@ -1034,10 +1099,10 @@
       }
 
       // 避免重复创建
-      if (document.getElementById('glm-sniper-overlay')) return;
+      if (document.getElementById(OVERLAY_ID)) return;
 
       const overlay = document.createElement('div');
-      overlay.id = 'glm-sniper-overlay';
+      overlay.id = OVERLAY_ID;
       overlay.innerHTML = `
         <div style="
           position: fixed;
@@ -1071,16 +1136,13 @@
             ⚠ 如果订单没有显示需要支付的金额，请不要扫码付款！
           </div>
           <div style="margin-top:6px;">
-            <button id="glm-notif-btn" onclick="(function(){
-              if(Notification.permission==='granted'){return;}
-              Notification.requestPermission().then(p=>{
-                const btn=document.getElementById('glm-notif-btn');
-                if(btn) btn.textContent=p==='granted'?'🔔 通知已开启':'🔕 通知被拒绝';
-              });
-            })()" style="
+            <button id="glm-notif-btn" type="button" style="
               background:rgba(255,255,255,0.1);border:1px solid rgba(255,255,255,0.2);
               color:#ccc;padding:3px 8px;border-radius:4px;font-size:11px;cursor:pointer;
             ">🔔 开启通知</button>
+          </div>
+          <div id="glm-boot" style="color:#666;font-size:10px;margin-top:6px;">
+            页面: ${window.location.hostname}${window.location.pathname}
           </div>
           <div id="glm-log" style="
             margin-top: 8px;
@@ -1094,8 +1156,89 @@
         </div>
       `;
       document.body.appendChild(overlay);
+      markBoot('overlay-mounted', '悬浮窗已挂载');
+
+      const notifBtn = document.getElementById('glm-notif-btn');
+      if (notifBtn) {
+        notifBtn.addEventListener('click', () => {
+          if (getNotificationPermissionSafe() === 'granted') return;
+          requestNotificationPermissionSafe().then((permission) => {
+            const btn = document.getElementById('glm-notif-btn');
+            if (!btn) return;
+            btn.textContent = permission === 'granted' ? '🔔 通知已开启' :
+              permission === 'unsupported' ? '🔕 当前环境不支持通知' : '🔕 通知被拒绝';
+          });
+        });
+      }
 
       startCountdown();
+    }
+
+    /**
+     * 确保悬浮窗始终存在，解决 SPA 路由切换或 DOM 重建后悬浮窗丢失问题。
+     * @param {string} reason 触发重建的原因。
+     * @returns {void}
+     */
+    function ensureOverlayMounted(reason) {
+      if (!isTargetPage()) return;
+      if (document.getElementById(OVERLAY_ID)) return;
+      markBoot('overlay-remount', reason);
+      createOverlay();
+    }
+
+    /**
+     * 安装路由监听，兼容 pushState/replaceState/popstate/hashchange 场景。
+     * @returns {void}
+     */
+    function installRouteHooks() {
+      if (runtime.routeHooksInstalled) return;
+      runtime.routeHooksInstalled = true;
+
+      const hookHistory = (methodName) => {
+        const originalMethod = history[methodName];
+        if (typeof originalMethod !== 'function') return;
+        history[methodName] = function (...args) {
+          const result = originalMethod.apply(this, args);
+          setTimeout(() => ensureOverlayMounted(`history.${methodName}`), 50);
+          return result;
+        };
+      };
+
+      hookHistory('pushState');
+      hookHistory('replaceState');
+      window.addEventListener('popstate', () => setTimeout(() => ensureOverlayMounted('popstate'), 50));
+      window.addEventListener('hashchange', () => setTimeout(() => ensureOverlayMounted('hashchange'), 50));
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') {
+          setTimeout(() => ensureOverlayMounted('visibilitychange'), 50);
+        }
+      });
+      markBoot('route-hooks-installed');
+    }
+
+    /**
+     * 安装悬浮窗保活监控，页面重绘或节点被删除时自动补挂。
+     * @returns {void}
+     */
+    function installOverlayWatcher() {
+      if (runtime.overlayWatcherInstalled) return;
+      runtime.overlayWatcherInstalled = true;
+
+      const startWatch = () => {
+        if (!document.body) {
+          setTimeout(startWatch, 100);
+          return;
+        }
+        new MutationObserver(() => {
+          ensureOverlayMounted('mutation-observer');
+        }).observe(document.body, { childList: true, subtree: true });
+      };
+
+      startWatch();
+      setInterval(() => {
+        if (!document.hidden) ensureOverlayMounted('heartbeat');
+      }, 2000);
+      markBoot('overlay-watcher-installed');
     }
 
     function log(msg) {
@@ -1134,6 +1277,7 @@
     }
 
     function startCountdown() {
+      if (state.countdownId) return;
       let _prewarmDone = false; // 防止多次预热
 
       const update = () => {
@@ -1994,6 +2138,14 @@
 
     // ==================== 11. 启动 ====================
     function init() {
+      if (runtime.initFinished) {
+        ensureOverlayMounted('init-reentry');
+        return;
+      }
+      markBoot('init-start');
+      installRouteHooks();
+      installOverlayWatcher();
+
       // 启动错误恢复
       setupAutoRetryRefresh(); // 全页面级别的强刷兜底
       setupErrorSuppressor(); // DOM级别的错误抑制 + SPA路由重试
@@ -2005,7 +2157,7 @@
 
       // 通知权限：不自动请求（避免被浏览器静默拒绝），由用户点击悬浮窗按钮触发
       // 已授权时更新按钮文字
-      if (Notification.permission === 'granted') {
+      if (getNotificationPermissionSafe() === 'granted') {
         setTimeout(() => {
           const btn = document.getElementById('glm-notif-btn');
           if (btn) btn.textContent = '🔔 通知已开启';
@@ -2046,6 +2198,8 @@
       log('提前10秒自动刷新，到点自动抢购');
       log('页面加载失败会自动强刷');
       log('检测到验证码/支付弹窗会冻结刷新');
+      runtime.initFinished = true;
+      markBoot('init-finished');
 
       // 如果当前已经是抢购时间窗口内（刚好打开页面），立即开始
       if (isInPurchaseTime()) {
@@ -2086,5 +2240,10 @@
     };
     */
 
-    init();
+    try {
+      init();
+    } catch (error) {
+      markBoot('init-error', error && error.message ? error.message : String(error));
+      console.error('[GLM Sniper] 初始化失败:', error);
+    }
   })();
