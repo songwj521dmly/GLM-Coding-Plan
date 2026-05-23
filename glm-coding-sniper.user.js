@@ -1117,6 +1117,108 @@
       return _xhrSend.apply(this, args);
     };
 
+    const ABNORMAL_PURCHASE_MODAL_KEYWORDS = [
+      '购买人数过多',
+      '访问人数较多',
+      '请刷新重试',
+      '服务繁忙',
+      '请稍后再试',
+      '系统繁忙',
+      '人数过多',
+      '排队',
+      '拥挤',
+    ];
+
+    let _abnormalModalRetryTimer = null;
+    let _lastAbnormalModalAt = 0;
+
+    /**
+     * 判断模态框是否为“人数过多/服务繁忙”类异常购买弹窗。
+     * @param {Element} modal 模态框元素。
+     * @returns {boolean} 是否命中异常弹窗特征。
+     */
+    function isAbnormalPurchaseModal(modal) {
+      if (!modal) return false;
+      const text = modal.textContent || '';
+      const hasBusyText = ABNORMAL_PURCHASE_MODAL_KEYWORDS.some((kw) => text.includes(kw));
+      const looksLikePurchaseFlow = text.includes('购买') || text.includes('订阅') || text.includes('支付') || text.includes('付款');
+      return hasBusyText && looksLikePurchaseFlow;
+    }
+
+    /**
+     * 尝试关闭异常购买弹窗，优先走页面自带的关闭/确认按钮。
+     * @param {Element} modal 模态框元素。
+     * @returns {boolean} 是否执行了关闭动作。
+     */
+    function tryCloseAbnormalModal(modal) {
+      if (!modal) return false;
+      const closeSelectors = [
+        'button[aria-label*="关闭"]',
+        'button[title*="关闭"]',
+        '[class*="close"]',
+        '[class*="Close"]',
+        '[aria-label="close"]',
+      ];
+      for (const selector of closeSelectors) {
+        const el = modal.querySelector(selector);
+        if (el) {
+          el.click?.();
+          el.dispatchEvent?.(new MouseEvent('click', { bubbles: true, cancelable: true }));
+          return true;
+        }
+      }
+
+      const buttonKeywords = ['关闭', '取消', '知道了', '我知道了', '确定', '稍后再试'];
+      const buttons = modal.querySelectorAll('button, a[role="button"], span');
+      for (const btn of buttons) {
+        const text = (btn.textContent || '').trim();
+        if (buttonKeywords.some((kw) => text.includes(kw))) {
+          btn.click?.();
+          btn.dispatchEvent?.(new MouseEvent('click', { bubbles: true, cancelable: true }));
+          return true;
+        }
+      }
+
+      // 最后兜底：隐藏异常层，避免其持续遮挡抢购流程。
+      modal.style.display = 'none';
+      modal.style.pointerEvents = 'none';
+      return true;
+    }
+
+    /**
+     * 异常购买弹窗关闭后，重置状态并继续抢购。
+     * @param {string} reason 触发重试的原因说明。
+     * @returns {void}
+     */
+    function scheduleRetryAfterAbnormalModal(reason) {
+      const now = Date.now();
+      if (_abnormalModalRetryTimer || now - _lastAbnormalModalAt < 1500) return;
+      _lastAbnormalModalAt = now;
+
+      log(`[异常弹窗] ${reason}，准备关闭并继续抢购`);
+      setStatus('异常弹窗已关闭，继续抢购...', '#ff8800');
+      state.modalVisible = false;
+      state.orderCreated = false;
+      _lastModalType = null;
+
+      _abnormalModalRetryTimer = setTimeout(() => {
+        _abnormalModalRetryTimer = null;
+        if (_confirmedSoldOut) return;
+        if (state.timerId) { clearInterval(state.timerId); state.timerId = null; }
+        state.isRunning = false;
+        state.retryCount = 0;
+        _forcePayDialogCalled = false;
+        selectBillingPeriod();
+        ensureProductId();
+        if (isInPurchaseTime()) {
+          state.isRunning = true;
+          startSnipe();
+        } else {
+          setStatus('等待抢购时间...', '#aaa');
+        }
+      }, 800);
+    }
+
     // --- 2c. 弹窗保护：检测验证码/支付弹窗，一旦出现则冻结所有刷新逻辑 ---
     function setupModalProtector() {
       if (!document.body) {
@@ -1132,6 +1234,13 @@
         let foundRealModal = false;
         for (const modal of modals) {
           if (modal.offsetParent === null || modal.offsetHeight < 30) continue;
+          if (isAbnormalPurchaseModal(modal)) {
+            const closed = tryCloseAbnormalModal(modal);
+            if (closed) {
+              scheduleRetryAfterAbnormalModal('检测到购买人数过多/服务繁忙弹窗');
+            }
+            continue;
+          }
           // 必须包含验证码或支付相关内容才算真正的弹窗
           const text = modal.textContent || '';
           const isCaptcha = text.includes('验证') || text.includes('滑动') || text.includes('拖动') ||
@@ -1979,6 +2088,19 @@
                               node.closest?.('[class*="modal"], [class*="dialog"], [role="dialog"]');
               const text = node.textContent || '';
               const hasPayText = text.includes('扫码') || text.includes('支付宝') || text.includes('微信支付');
+              const abnormalModal = isModal ? (node.matches?.('[class*="modal"], [class*="dialog"], [role="dialog"]') ? node : node.closest?.('[class*="modal"], [class*="dialog"], [role="dialog"]')) : null;
+
+              if (abnormalModal && isAbnormalPurchaseModal(abnormalModal)) {
+                log('检测到异常购买弹窗，尝试关闭并继续抢购');
+                tryCloseAbnormalModal(abnormalModal);
+                state.orderCreated = false;
+                if (state.timerId) {
+                  clearInterval(state.timerId);
+                  state.timerId = null;
+                }
+                scheduleRetryAfterAbnormalModal('检测到异常购买弹窗');
+                continue;
+              }
 
               if (hasQR) {
                 // 真正检测到二维码图像才通知
