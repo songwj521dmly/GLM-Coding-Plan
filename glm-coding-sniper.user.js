@@ -1,7 +1,7 @@
   // ==UserScript==
   // @name         GLM Coding Plan Pro 自动抢购
   // @namespace    https://bigmodel.cn
-  // @version      1.6.2
+  // @version      1.6.3
   // @description  每天10:00自动抢购GLM Coding Plan 套餐，拦截售罄+自动点击+错误恢复+弹窗保护+路由重挂载+套餐映射可视化防错
   // @author       songwj
   // @match        https://open.bigmodel.cn/*
@@ -1119,12 +1119,16 @@
 
     const ABNORMAL_PURCHASE_MODAL_KEYWORDS = [
       '购买人数过多',
+      '购买人数较多',
       '访问人数较多',
-      '请刷新重试',
-      '服务繁忙',
-      '请稍后再试',
-      '系统繁忙',
+      '人数较多',
       '人数过多',
+      '请刷新重试',
+      '请稍后再试',
+      '请稍后重试',
+      '当前购买人数',
+      '服务繁忙',
+      '系统繁忙',
       '排队',
       '拥挤',
     ];
@@ -1320,13 +1324,13 @@
         if (state.modalVisible) return;
 
         const bodyText = document.body.textContent || '';
-        if (!bodyText.includes('访问人数较多') && !bodyText.includes('请刷新重试') && !bodyText.includes('服务繁忙')) return;
+        if (!bodyText.includes('访问人数较多') && !bodyText.includes('请刷新重试') && !bodyText.includes('请稍后重试') && !bodyText.includes('人数较多') && !bodyText.includes('服务繁忙')) return;
 
         // 找到包含错误信息的容器并隐藏
         const errorNodes = document.querySelectorAll('div, section, p');
         for (const node of errorNodes) {
           const t = node.textContent || '';
-          if ((t.includes('访问人数较多') || t.includes('请刷新重试')) && node.offsetHeight > 50) {
+          if ((t.includes('访问人数较多') || t.includes('人数较多') || t.includes('请刷新重试') || t.includes('请稍后重试')) && node.offsetHeight > 50) {
             node.style.display = 'none';
             console.log('[GLM Sniper] 隐藏错误页面，触发重新加载...');
 
@@ -2196,7 +2200,7 @@
         if (state.modalVisible) return;
 
         const bodyText = document.body?.textContent || '';
-        const errorKeywords = ['访问人数较多', '请刷新重试', '请稍后再试', '服务繁忙', '网络错误', '加载失败'];
+        const errorKeywords = ['访问人数较多', '人数较多', '请刷新重试', '请稍后再试', '请稍后重试', '服务繁忙', '网络错误', '加载失败'];
         const isError = errorKeywords.some(kw => bodyText.includes(kw));
 
         // 页面 HTML 都没加载出来（完全空白 / 502 / 503 纯文本）
@@ -2249,7 +2253,7 @@
 
         // 检测页面是否有购买按钮（说明页面正常加载了）
         const bodyText = document.body?.textContent || '';
-        const hasError = ['访问人数较多', '请刷新重试', '服务繁忙'].some(kw => bodyText.includes(kw));
+        const hasError = ['访问人数较多', '人数较多', '请刷新重试', '请稍后重试', '服务繁忙'].some(kw => bodyText.includes(kw));
         if (hasError) return;
 
         // 必须找到套餐专属的购买按钮（排除"即刻订阅"等通用 CTA），且按钮不含售罄字样
